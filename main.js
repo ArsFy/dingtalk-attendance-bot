@@ -87,10 +87,10 @@ const accessToken = async () => {
     }
 }
 
-const AddLog = (uid, name, time, type) => {
-    runQuery("INSERT INTO logs (uid, name, time, type) VALUES (?, ?, ?, ?)", [uid, name, time, type])
-        .then(() => { })
-        .catch(err => console.log(err));
+const AddLog = async (uid, name, time, type) => {
+    try {
+        await runQuery("INSERT INTO logs (uid, name, time, type) VALUES (?, ?, ?, ?)", [uid, name, time, type]);
+    } catch (e) { }
 }
 
 const OnDuty = async (userid, time) => {
@@ -98,15 +98,11 @@ const OnDuty = async (userid, time) => {
         Data.aliveUser += 1;
         Data.list.push(userid);
 
-        const name = Cache.usermap[userid];
+        const name = Cache.usermap[userid] ? Cache.usermap[userid] : `姓名缺失(${userid})`;
 
         console.log(moment(new Date(time)).format("YYYY-MM-DD HH:mm:ss") + ` Logs: ${name} 上班记录推送`)
-        try {
-            await client.sendGroupMsg(config.user_push_group, `@${name ? name : `姓名缺失(${userid})`} 正在值班\n目前值班人数 ${Data.aliveUser}\n状态：正常营业中`)
-        } catch (e) { }
-
-        AddLog(String(userid), name, time, "OnDuty");
-    };
+        return name;
+    } else return '';
 }
 
 const OffDuty = async (userid, time) => {
@@ -115,36 +111,28 @@ const OffDuty = async (userid, time) => {
         Data.aliveUser -= 1;
         Data.list.splice(index, 1);
 
-        const name = Cache.usermap[userid];
+        const name = Cache.usermap[userid] ? Cache.usermap[userid] : `姓名缺失(${userid})`;
 
         console.log(moment(new Date(time)).format("YYYY-MM-DD HH:mm:ss") + ` Logs: ${name} 下班记录推送`)
-
-        if (Data.aliveUser !== 0)
-            try {
-                await client.sendGroupMsg(config.user_push_group, `@${name ? name : `姓名缺失(${userid})`} 下班了\n目前值班人数 ${Data.aliveUser}\n状态：正常营业中`)
-            } catch (e) { }
-        else
-            try {
-                await client.sendGroupMsg(config.user_push_group, `@${name ? name : `姓名缺失(${userid})`} 下班了\n目前没有人在值班\n状态：等待下一个人上班`)
-            } catch (e) { }
-
-        AddLog(String(userid), name, time, "OffDuty");
-    };
+        return name;
+    } else return '';
 }
 
 const getAttendance = async () => {
     // For userlist (slice: 50 items)
-    for (let iii = 0; iii < Cache.userlist.length; iii += 50) {
-        const nowTime = moment(new Date()).format("YYYY-MM-DD 00:00:00");
+    let msg = '', startId = 0;
+    let d = await runQuery("SELECT id FROM logs ORDER BY id DESC LIMIT 0,1", [])
+    if (d.length > 0) startId = d[0].id;
 
+    for (let iii = 0; iii < Cache.userlist.length; iii += 50) {
         let attendance = await axios({
             method: 'POST',
             url: "https://oapi.dingtalk.com/attendance/list?access_token=" + Cache.accessToken,
             data: {
                 "limit": 50,
-                "workDateFrom": nowTime,
+                "workDateFrom": moment(new Date()).format("YYYY-MM-DD 00:00:00"),
                 "offset": Cache.offset,
-                "workDateTo": nowTime,
+                "workDateTo": moment(new Date((new Date() / 1) + 1000 * 60 * 60 * 24)).format("YYYY-MM-DD 00:00:00"),
                 "userIdList": JSON.stringify(Cache.userlist.slice(iii, iii + 50))
             }
         }).catch(err => {
@@ -156,15 +144,56 @@ const getAttendance = async () => {
             SaveCache();
 
             for (let i = 0; i < attendance.data.recordresult.length; i++) {
+                const name = Cache.usermap[attendance.data.recordresult[i].userId]
+                    ? Cache.usermap[attendance.data.recordresult[i].userId]
+                    : `姓名缺失(${attendance.data.recordresult[i].userId})`;
+
                 switch (attendance.data.recordresult[i].checkType) {
-                    case "OnDuty": OnDuty(attendance.data.recordresult[i].userId, attendance.data.recordresult[i].baseCheckTime); break;
-                    case "OffDuty": OffDuty(attendance.data.recordresult[i].userId, attendance.data.recordresult[i].baseCheckTime); break;
+                    case "OnDuty":
+                        await AddLog(String(attendance.data.recordresult[i].userId), name, attendance.data.recordresult[i].baseCheckTime, "OnDuty");
+                        break;
+                    case "OffDuty":
+                        await AddLog(String(attendance.data.recordresult[i].userId), name, attendance.data.recordresult[i].baseCheckTime, "OffDuty");
+                        break;
                     default: console.log("Unknown checkType:", attendance.data.recordresult[i].checkType)
                 }
-
-                saveData();
             }
         } else console.log("Get attendance list failed: " + attendance.data.errmsg);
+    }
+
+    let dblogs = await runQuery("SELECT id, uid, name, time, type FROM logs WHERE id > ? ORDER BY time", [startId]);
+    if (dblogs.length > 0) {
+        let on_namelist = [], off_namelist = [];
+
+        for (let i = 0; i < dblogs.length; i++) {
+            let name = '';
+            switch (dblogs[i].type) {
+                case "OnDuty":
+                    name = await OnDuty(dblogs[i].uid, dblogs[i].time);
+                    if (name != "") on_namelist.push(name);
+                    break;
+                case "OffDuty":
+                    name = await OffDuty(dblogs[i].uid, dblogs[i].time);
+                    if (name != "") off_namelist.push(name);
+                    break;
+                default: console.log("Unknown checkType:", dblogs[i].time)
+            }
+        }
+
+        if (on_namelist.length > 0) msg += `${on_namelist.join(" ")} 正在值班\n`;
+        if (off_namelist.length > 0) msg += `${off_namelist.join(" ")} 下班了\n`;
+
+        if (off_namelist.length > 0 || on_namelist.length > 0)
+            if (Data.aliveUser != 0) msg += `目前值班人数 ${Data.aliveUser}\n状态：正常营业中\n`
+            else msg += `目前没有人在值班\n状态：等待下一个人上班\n`;
+
+        if (msg != '') {
+            try {
+                await client.sendGroupMsg(config.user_push_group, msg.slice(0, msg.length - 1));
+            } catch (e) { }
+        }
+
+        saveData();
     }
 }
 
@@ -174,7 +203,7 @@ const formatDuration = (milliseconds) => {
 }
 
 const getAttendanceTime = async (t, o) => {
-    const data = await runQuery("SELECT id, uid, name, time, type FROM logs WHERE time > ?", [t.getTime()]);
+    const data = await runQuery("SELECT id, uid, name, time, type FROM logs WHERE time > ? ORDER BY time", [t.getTime()]);
 
     const fd = {}, sd = {};
     for (let i = 0; i < data.length; i++) {
@@ -183,7 +212,7 @@ const getAttendanceTime = async (t, o) => {
                 fd[data[i].name] = data[i].time;
                 break;
             case "OffDuty":
-                if (fd[data[i].name] != undefined) {
+                if (fd[data[i].name] != undefined && fd[data[i].name] < data[i].time) {
                     sd[data[i].name] = (sd[data[i].name] ? sd[data[i].name] : 0) + (data[i].time - fd[data[i].name]);
                     delete fd[data[i].name];
                 }
@@ -202,7 +231,7 @@ const getAttendanceTime = async (t, o) => {
     if (Object.keys(fd).length !== 0) {
         text += '\n正在进行的值班时长:\n';
         for (let i in fd) {
-            text += `${i}: ${formatDuration(new Date() - fd[i])}\n`;
+            if (new Date() - fd[i] > 0) text += `${i}: ${formatDuration(new Date() - fd[i])}\n`;
         }
     }
 
