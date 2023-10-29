@@ -241,6 +241,7 @@ const getAttendanceTime = async (t, o) => {
 // Bot Start
 client.on("system.online", async () => {
     await accessToken();
+    cron.schedule("0 * * * * *", () => accessToken());
 
     cron.schedule('50 9-59/10 * * * *', () => {
         getAttendance();
@@ -355,6 +356,11 @@ client.on("message", e => {
                 t.setHours(0, 0, 0, 0);
                 e.reply(getAttendanceTime(new Date(t.getTime() - ((t.getDay() + 6) % 7) * 24 * 60 * 60 * 1000))).then(() => { }).catch(e => { });
                 break;
+            case "/手动更新数据":
+                if (e.group_id === config.member_group) {
+                    getAttendance();
+                    e.reply("正在手动更新...\n警告：请尽量不要使用手动更新");
+                }
         }
     }
 });
